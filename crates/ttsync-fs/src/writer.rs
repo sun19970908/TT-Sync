@@ -48,7 +48,7 @@ pub(crate) async fn write_file_to_path(
     drop(file);
 
     rename_with_retry(&tmp_path, full_path).await?;
-    set_file_modified_ms(full_path, modified_ms)?;
+    set_file_modified_ms(full_path, modified_ms).await?;
 
     Ok(())
 }
@@ -209,17 +209,52 @@ fn download_tmp_path(full_path: &Path) -> PathBuf {
     }
 }
 
-/// ERROR_ACCESS_DENIED on Windows. It covers replacing a read-only target
-/// (git loose objects are stored 0444); the transient-lock meaning is handled
-/// separately. No-op predicate off Windows, where raw error 5 is EIO.
+/// Whether an IO error is a transient Windows lock worth retrying:
+/// ERROR_ACCESS_DENIED (5, also returned when a target handle lacks delete
+/// sharing) or ERROR_SHARING_VIOLATION (32). Off Windows these raw numbers
+/// mean unrelated errors (EIO/EPIPE), so the predicate is always false there.
 #[cfg(windows)]
-fn is_windows_access_denied(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(5)
+fn is_transient_windows_lock(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5) | Some(32))
 }
 
 #[cfg(not(windows))]
-fn is_windows_access_denied(_error: &std::io::Error) -> bool {
+fn is_transient_windows_lock(_error: &std::io::Error) -> bool {
     false
+}
+
+/// Retry an filesystem operation that hit a transient Windows lock, with
+/// exponential backoff. The read-only-target recovery lives in the operation
+/// closure itself; here only the retry policy is added.
+async fn retry_transient_lock<F, T>(action: &str, path: &Path, mut op: F) -> Result<T, SyncError>
+where
+    F: FnMut() -> Result<T, std::io::Error>,
+{
+    const ATTEMPTS: u32 = 8;
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_windows_lock(&error) && attempt + 1 < ATTEMPTS => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(10 * 2u64.pow(attempt))).await;
+            }
+            Err(error) => {
+                return Err(SyncError::Io(format!(
+                    "{action} {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Err(SyncError::Io(format!(
+        "{action} {} still locked after {ATTEMPTS} attempts: {}",
+        path.display(),
+        last_error
+            .as_ref()
+            .map(std::io::Error::to_string)
+            .unwrap_or_default()
+    )))
 }
 
 /// Clear the read-only attribute of an existing file. On Windows both
@@ -251,11 +286,13 @@ fn clear_readonly_attribute(_path: &Path) -> std::io::Result<()> {
 }
 
 async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SyncError> {
+    // Read-only-target recovery happens inside one attempt; a genuine sharing
+    // violation stays a lock error so the outer backoff retries the rename.
     let attempt = || -> std::io::Result<()> {
         match std::fs::rename(from, to) {
             Ok(()) => Ok(()),
             // Read-only target: clear the attribute and replace it.
-            Err(error) if is_windows_access_denied(&error) => {
+            Err(error) if is_transient_windows_lock(&error) => {
                 clear_readonly_attribute(to)?;
                 std::fs::rename(from, to)
             }
@@ -269,14 +306,20 @@ async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SyncError> {
         }
     };
 
-    attempt().map_err(|error| SyncError::Io(error.to_string()))
+    match attempt() {
+        Ok(()) => Ok(()),
+        Err(error) if is_transient_windows_lock(&error) => {
+            retry_transient_lock("rename", to, attempt).await
+        }
+        Err(error) => Err(SyncError::Io(error.to_string())),
+    }
 }
 
-fn set_file_modified_ms(path: &Path, modified_ms: u64) -> Result<(), SyncError> {
+async fn set_file_modified_ms(path: &Path, modified_ms: u64) -> Result<(), SyncError> {
     let secs = (modified_ms / 1000) as i64;
     let nanos = ((modified_ms % 1000) * 1_000_000) as u32;
     let mtime = filetime::FileTime::from_unix_time(secs, nanos);
-    filetime::set_file_mtime(path, mtime).map_err(|e| SyncError::Io(e.to_string()))
+    retry_transient_lock("set mtime", path, || filetime::set_file_mtime(path, mtime)).await
 }
 
 #[cfg(test)]
@@ -289,7 +332,7 @@ mod tests {
 
     use crate::layout::WorkspaceMounts;
 
-    use super::{delete_file, write_file_to_path};
+    use super::{delete_file, retry_transient_lock, write_file_to_path};
 
     #[tokio::test]
     async fn deleting_last_git_file_prunes_fileless_git_tree() {
@@ -465,6 +508,24 @@ mod tests {
         assert!(!settings_target.exists());
 
         std::fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retries_transient_windows_access_denied_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let result = retry_transient_lock("probe", Path::new("locked-file"), || {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(42u32)
+        })
+        .await
+        .expect("transient lock retried");
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     fn unique_temp_dir() -> PathBuf {
