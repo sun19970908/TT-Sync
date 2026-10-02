@@ -28,7 +28,7 @@ pub(crate) async fn write_file_to_path(
     if let Some(parent) = full_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| SyncError::Io(e.to_string()))?;
+            .map_err(|e| SyncError::Io(format!("create dir {}: {e}", parent.display())))?;
     }
 
     let tmp_path = download_tmp_path(full_path);
@@ -38,13 +38,13 @@ pub(crate) async fn write_file_to_path(
         .truncate(true)
         .open(&tmp_path)
         .await
-        .map_err(|e| SyncError::Io(e.to_string()))?;
+        .map_err(|e| SyncError::Io(format!("open {}: {e}", tmp_path.display())))?;
 
-    copy_to_file(data, &mut file).await?;
+    copy_to_file(data, &mut file, full_path).await?;
 
     file.flush()
         .await
-        .map_err(|e| SyncError::Io(e.to_string()))?;
+        .map_err(|e| SyncError::Io(format!("flush {}: {e}", full_path.display())))?;
     drop(file);
 
     rename_with_retry(&tmp_path, full_path).await?;
@@ -56,19 +56,19 @@ pub(crate) async fn write_file_to_path(
 async fn copy_to_file(
     data: &mut (dyn AsyncRead + Send + Unpin),
     file: &mut tokio::fs::File,
+    destination: &Path,
 ) -> Result<(), SyncError> {
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = data
-            .read(&mut buffer)
-            .await
-            .map_err(|e| SyncError::Io(e.to_string()))?;
+        let read = data.read(&mut buffer).await.map_err(|e| {
+            SyncError::Io(format!("read bundle for {}: {e}", destination.display()))
+        })?;
         if read == 0 {
             return Ok(());
         }
         file.write_all(&buffer[..read])
             .await
-            .map_err(|e| SyncError::Io(e.to_string()))?;
+            .map_err(|e| SyncError::Io(format!("write {}: {e}", destination.display())))?;
     }
 }
 
@@ -311,7 +311,11 @@ async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SyncError> {
         Err(error) if is_transient_windows_lock(&error) => {
             retry_transient_lock("rename", to, attempt).await
         }
-        Err(error) => Err(SyncError::Io(error.to_string())),
+        Err(error) => Err(SyncError::Io(format!(
+            "rename {} -> {}: {error}",
+            from.display(),
+            to.display()
+        ))),
     }
 }
 

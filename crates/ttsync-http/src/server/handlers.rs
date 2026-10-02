@@ -335,7 +335,8 @@ where
 
     store
         .write_file(&sync_path, &mut exact, meta.modified_ms)
-        .await?;
+        .await
+        .map_err(|e| SyncError::Io(format!("write {}: {e}", sync_path)))?;
     expect_eof(&mut reader, "uploaded file").await?;
 
     Ok(Json(json!({ "ok": true })))
@@ -467,7 +468,8 @@ where
         snapshot
             .store
             .write_file(&sync_path, &mut exact, meta.modified_ms)
-            .await?;
+            .await
+            .map_err(|e| SyncError::Io(format!("write {}: {e}", sync_path)))?;
 
         files_written += 1;
     }
@@ -510,7 +512,11 @@ where
 
     if record.mode == SyncMode::Mirror {
         for path in &record.delete {
-            record.store.delete_file(path).await?;
+            record
+                .store
+                .delete_file(path)
+                .await
+                .map_err(|e| SyncError::Io(format!("delete {}: {e}", path)))?;
         }
     }
     record.store.commit().await?;
