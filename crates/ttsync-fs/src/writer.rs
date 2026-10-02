@@ -90,6 +90,17 @@ pub async fn delete_file(mounts: &WorkspaceMounts, sync_path: &SyncPath) -> Resu
         }
     }
 
+    // Read-only targets (e.g. git loose objects, stored as 0444) reject
+    // deletion on Windows until the attribute is cleared.
+    if let Err(error) = clear_readonly_attribute(&full_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(SyncError::Io(format!(
+            "clear attributes {}: {error}",
+            full_path.display()
+        )));
+    }
+
     match tokio::fs::remove_file(&full_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -198,17 +209,67 @@ fn download_tmp_path(full_path: &Path) -> PathBuf {
     }
 }
 
-async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SyncError> {
-    match tokio::fs::rename(from, to).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = tokio::fs::remove_file(to).await;
-            tokio::fs::rename(from, to)
-                .await
-                .map_err(|e| SyncError::Io(e.to_string()))
-        }
-        Err(e) => Err(SyncError::Io(e.to_string())),
+/// ERROR_ACCESS_DENIED on Windows. It covers replacing a read-only target
+/// (git loose objects are stored 0444); the transient-lock meaning is handled
+/// separately. No-op predicate off Windows, where raw error 5 is EIO.
+#[cfg(windows)]
+fn is_windows_access_denied(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(5)
+}
+
+#[cfg(not(windows))]
+fn is_windows_access_denied(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Clear the read-only attribute of an existing file. On Windows both
+/// replacing and deleting a read-only file fail with ERROR_ACCESS_DENIED. A
+/// missing file is not an error. No-op off Windows, where read-only mode bits
+/// never block rename or unlink.
+#[cfg(windows)]
+fn clear_readonly_attribute(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        // Windows-only code path: toggling the DOS read-only attribute is
+        // exactly what we need; the Unix "world writable" lint does not apply
+        // (this function never compiles into a unix build).
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
     }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn clear_readonly_attribute(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), SyncError> {
+    let attempt = || -> std::io::Result<()> {
+        match std::fs::rename(from, to) {
+            Ok(()) => Ok(()),
+            // Read-only target: clear the attribute and replace it.
+            Err(error) if is_windows_access_denied(&error) => {
+                clear_readonly_attribute(to)?;
+                std::fs::rename(from, to)
+            }
+            // Platforms without replace semantics: drop the stale target first.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                clear_readonly_attribute(to)?;
+                std::fs::remove_file(to)?;
+                std::fs::rename(from, to)
+            }
+            Err(error) => Err(error),
+        }
+    };
+
+    attempt().map_err(|error| SyncError::Io(error.to_string()))
 }
 
 fn set_file_modified_ms(path: &Path, modified_ms: u64) -> Result<(), SyncError> {
@@ -228,7 +289,7 @@ mod tests {
 
     use crate::layout::WorkspaceMounts;
 
-    use super::delete_file;
+    use super::{delete_file, write_file_to_path};
 
     #[tokio::test]
     async fn deleting_last_git_file_prunes_fileless_git_tree() {
@@ -366,6 +427,44 @@ mod tests {
             default_user_root: data_root.join("default-user"),
             extensions_root: data_root.join("extensions").join("third-party"),
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn replaces_and_deletes_readonly_target_files() {
+        // Git stores loose objects read-only; Windows rejects replacing or
+        // deleting them unless the attribute is cleared first.
+        let data_root = unique_temp_dir();
+        let mounts = test_mounts(&data_root);
+        std::fs::create_dir_all(&mounts.default_user_root).unwrap();
+        let target = mounts.default_user_root.join("readonly-object");
+        std::fs::write(&target, b"old").unwrap();
+
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        write_file_to_path(&target, &mut std::io::Cursor::new(b"new".to_vec()), 100)
+            .await
+            .expect("readonly target is replaced");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        // Verify deletion through the catalog-checked public path too
+        // (settings.json is a file-only dataset entry).
+        let settings_target = mounts.default_user_root.join("settings.json");
+        std::fs::write(&settings_target, b"{}").unwrap();
+        let mut perms = std::fs::metadata(&settings_target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&settings_target, perms).unwrap();
+        delete_file(
+            &mounts,
+            &SyncPath::new("default-user/settings.json").unwrap(),
+        )
+        .await
+        .expect("readonly target is deleted");
+        assert!(!settings_target.exists());
+
+        std::fs::remove_dir_all(data_root).unwrap();
     }
 
     fn unique_temp_dir() -> PathBuf {
